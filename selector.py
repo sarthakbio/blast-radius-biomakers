@@ -205,10 +205,100 @@ print(json.dumps(out))
 """
 
 
+_BASE_READY = None
+
+
+def _mod_name(rel):
+    m = rel[:-3].replace("/", ".")
+    return m[: -len(".__init__")] if m.endswith(".__init__") else m
+
+
+def _fork_check(patched, modules):
+    """Fast path: sqlglot is imported once (pristine) in this process; for
+    patches that only touch modules not loaded yet (dialects, parsers,
+    generators ...), fork and import them patched.  Returns stdout text, or
+    None when the fast path does not apply."""
+    global _BASE_READY
+    if not hasattr(os, "fork"):
+        return None
+    if _BASE_READY is None:
+        try:
+            sys.path.insert(0, str(SRC))
+            import logging
+
+            logging.disable(logging.CRITICAL)
+            import sqlglot  # noqa: F401
+            import sqlglot.expressions  # noqa: F401
+
+            _BASE_READY = True
+        except Exception as e:
+            log("base import failed", repr(e))
+            _BASE_READY = False
+    if not _BASE_READY or "BASE" in modules:
+        return None
+    if any(_mod_name(rel) in sys.modules for rel in patched):
+        return None
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        code = 1
+        try:
+            os.close(r)
+            ns = {"__name__": "__brchild__"}
+            body = _IMPORT_CHILD.split("import sqlglot\nimport sqlglot.expressions", 1)[1]
+            head = _IMPORT_CHILD.split("sys.meta_path.insert(0, Finder())", 1)[0]
+            import io as _io
+
+            sys.stdin = _io.StringIO(json.dumps(patched))
+            sys.argv = ["x", str(SRC)] + sorted(modules)
+            buf = _io.StringIO()
+            sys.stdout = buf
+            exec(head + "sys.meta_path.insert(0, Finder())\n" + body, ns)
+            os.write(w, buf.getvalue().encode())
+            code = 0
+        except BaseException:
+            pass
+        finally:
+            os._exit(code)
+    os.close(w)
+    chunks = []
+    while True:
+        b = os.read(r, 65536)
+        if not b:
+            break
+        chunks.append(b)
+    os.close(r)
+    _, status = os.waitpid(pid, 0)
+    if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
+        return b"".join(chunks).decode()
+    return ""  # import failed
+
+
 def import_check(patched, modules):
     """Import the given modules with the patched sources (in a child
     process, no network).  Returns True when every import succeeds."""
     import subprocess
+
+    out = None
+    try:
+        out = _fork_check(patched, modules)
+    except Exception as e:
+        log("fork check error", repr(e))
+        out = None
+    if out is not None:
+        if not out.strip():
+            log("import check failed (fork)", sorted(modules))
+            return False
+        try:
+            fps = json.loads(out.strip().splitlines()[-1])
+        except Exception:
+            return False
+        ref = _fingerprints()
+        changed = [m for m, h in fps.items() if m in ref and ref[m] != h]
+        if changed:
+            log("import-time objects changed", changed)
+            return False
+        return True
 
     try:
         r = subprocess.run(
@@ -393,6 +483,7 @@ class Selector:
         self._trees = {}
         self._scopes = {}
         self._alltsrc = None
+        self._cattrs = {}
         self.pad = [set(), set()]
         self.patched = {}
         self.imp_mods = set()
@@ -576,10 +667,28 @@ class Selector:
                             base = tg
                             while isinstance(base, (ast.Subscript, ast.Attribute)):
                                 base = base.value
-                            if isinstance(base, ast.Name) and (base.id in globals_ or base.id == "cls" and tg is not base):
+                            shared = False
+                            # self.<attr>[...] = ... where <attr> is a class-level container
+                            # (or named like a cache) is shared across instances and tests
+                            if isinstance(tg, ast.Subscript) and isinstance(tg.value, ast.Attribute) and \
+                                    isinstance(tg.value.value, ast.Name) and tg.value.value.id in ("self", "cls"):
+                                attr = tg.value.attr
+                                shared = "cache" in attr.lower() or attr in self.class_attrs(path, tree)
+                            if shared or isinstance(base, ast.Name) and (base.id in globals_ or base.id == "cls" and tg is not base):
                                 out |= self.def_runners(cov, s0, e0)
                                 return out
         return out
+
+    def class_attrs(self, path, tree):
+        if path not in self._cattrs:
+            names = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef):
+                    for st in node.body:
+                        if isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(getattr(st, "value", None), (ast.Dict, ast.Call)):
+                            names |= assigned_names(st)
+            self._cattrs[path] = names
+        return self._cattrs[path]
 
     def import_level(self, path, tree, line, cov):
         if tree is None:
@@ -937,6 +1046,12 @@ class Selector:
 
     def select_helper(self, path, fp):
         # tests/helpers.py etc: tests in files importing it, narrowed by symbol
+        if path.endswith("/__init__.py"):
+            old = self.src(path) or ""
+            if same_code(old, apply_hunks(old, fp["hunks"])):
+                return set()
+            d = path.rsplit("/", 1)[0] + "/"
+            return {n for f, nums in self.m.by_file.items() if f.startswith(d) for n in nums}
         users = self.m.extra.get("helper_users", {}).get(path)
         if users is None:
             return None
