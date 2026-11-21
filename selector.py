@@ -130,6 +130,68 @@ def changed_old_lines(hunks):
     return touched
 
 
+# ---------------------------------------------------------------- import check
+
+_IMPORT_CHILD = r"""
+import importlib.abc, importlib.util, json, sys
+patched = json.loads(sys.stdin.read())
+src_root = sys.argv[1]
+
+class Finder(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        rel = name.replace(".", "/")
+        for cand, is_pkg in ((rel + ".py", False), (rel + "/__init__.py", True)):
+            if cand in patched:
+                loader = Loader(cand)
+                spec = importlib.util.spec_from_loader(name, loader, is_package=is_pkg, origin=src_root + "/" + cand)
+                if is_pkg:
+                    spec.submodule_search_locations = [src_root + "/" + rel]
+                return spec
+        return None
+
+class Loader(importlib.abc.Loader):
+    def __init__(self, rel):
+        self.rel = rel
+    def create_module(self, spec):
+        return None
+    def exec_module(self, module):
+        module.__file__ = src_root + "/" + self.rel
+        exec(compile(patched[self.rel], module.__file__, "exec"), module.__dict__)
+
+sys.meta_path.insert(0, Finder())
+sys.path.insert(0, src_root)
+import logging
+logging.disable(logging.CRITICAL)
+import sqlglot
+import sqlglot.expressions
+for m in sys.argv[2:]:
+    if m != "BASE":
+        __import__(m)
+"""
+
+
+def import_check(patched, modules):
+    """Import the given modules with the patched sources (in a child
+    process, no network).  Returns True when every import succeeds."""
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            [sys.executable, "-S", "-c", _IMPORT_CHILD, str(SRC)] + sorted(modules),
+            input=json.dumps(patched),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={"PATH": os.environ.get("PATH", ""), "HOME": "/tmp", "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+    except Exception as e:  # can't tell: assume it breaks
+        log("import check error", repr(e))
+        return False
+    if r.returncode != 0:
+        log("import check failed", modules, r.stderr.strip().splitlines()[-1:] if r.stderr else "")
+    return r.returncode == 0
+
+
 # ---------------------------------------------------------------- maps
 
 
@@ -275,6 +337,9 @@ class Selector:
         self._scopes = {}
         self._alltsrc = None
         self.pad = [set(), set()]
+        self.patched = {}
+        self.imp_mods = set()
+        self._impmap = None
         self._fxt = {}
 
     def scopes(self, path, tree):
@@ -342,6 +407,12 @@ class Selector:
             return "ALL"
         cov = self.m.cov(path) or {}
         sel = set()
+        self.patched[path] = new
+        imp = self.impmap().get(path, {})
+        for line in changed_old_lines(fp["hunks"]):
+            for l in (line, line - 1, line + 1):
+                for mname in imp.get(str(l), ()):
+                    self.imp_mods.add(mname)
         if path.startswith("sqlglot/typing/"):
             # tests/test_typing.py imports every typing module and compares the
             # metadata tables (and annotator code) against their parents
@@ -711,10 +782,54 @@ class Selector:
             return {self.m.by_id[i] for i in hit if i in self.m.by_id}
         return None
 
+    def impmap(self):
+        if self._impmap is None:
+            fn = MAP / "impmap.json"
+            self._impmap = json.loads(fn.read_text()) if fn.exists() else {}
+        return self._impmap
+
+    def import_breakers(self):
+        """If the patched code fails while a module is being imported, every
+        test that loads it can fail (in pytest-xdist, whichever test loads it
+        first in each worker).  Check by importing; widen if it breaks."""
+        if not self.imp_mods:
+            return set()
+        mods = set(self.imp_mods)
+        if "BASE" in mods:
+            # core tables feed the modules that parse/build SQL while importing
+            mods |= set(self.m.extra.get("import_heavy", []))
+        if import_check(self.patched, mods):
+            return set()
+        if "BASE" in mods and not import_check(self.patched, {"BASE"}):
+            return "ALL"
+        mods.discard("BASE")
+        out = set()
+        for m in mods:
+            parts = m.split(".")
+            base = parts[-1]
+            path = "/".join(parts) + ".py"
+            out |= self.module_users(path)
+            if self.m.cov(path) is None:
+                out |= self.module_users("/".join(parts) + "/__init__.py")
+            # tests that name the dialect anywhere
+            if len(parts) == 3 and parts[1] in ("dialects", "parsers", "generators", "typing"):
+                if self._alltsrc is None:
+                    self._alltsrc = self.test_sources(sorted(self.m.by_file))
+                pat = re.compile(r"[\"']" + re.escape(base) + r"[\"']|\bin dialects\b|dialects\)|dialect\.classes|dialects\.")
+                out |= {n for n, src in self._alltsrc.items() if pat.search(src)}
+                for f, nums in self.m.by_file.items():
+                    if f.endswith("/test_" + base + ".py"):
+                        out |= set(nums)
+            else:
+                return "ALL"
+        return out
+
     def select(self, patch_text):
         files = parse_patch(patch_text)
         sel = set()
         self.pad = [set(), set()]
+        self.patched = {}
+        self.imp_mods = set()
         for path, fp in files.items():
             p_old = fp["old"] or path
             if p_old.startswith("sqlglot/") and p_old.endswith(".py"):
@@ -752,6 +867,13 @@ class Selector:
                 r = None
             if r == "ALL" or r is None:
                 log("broad:", path)
+                return set(self.m.all)
+            sel |= r
+        if self.patched and self.imp_mods:
+            # only test-import when every patched file is a sqlglot module
+            r = self.import_breakers()
+            if r == "ALL":
+                log("broad: import breaks")
                 return set(self.m.all)
             sel |= r
         return sel
