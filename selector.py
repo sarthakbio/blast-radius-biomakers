@@ -164,9 +164,44 @@ import logging
 logging.disable(logging.CRITICAL)
 import sqlglot
 import sqlglot.expressions
+import hashlib
+from sqlglot.expressions import core as _core
+
+def _fp_value(v, depth=0):
+    if isinstance(v, _core.Expr):
+        return repr(v)
+    if depth < 2 and isinstance(v, (list, tuple, set, frozenset)):
+        items = [_fp_value(x, depth + 1) for x in v]
+        items = [x for x in items if x]
+        return "[" + ",".join(sorted(items) if isinstance(v, (set, frozenset)) else items) + "]" if items else ""
+    if depth < 2 and isinstance(v, dict):
+        items = []
+        for k, x in v.items():
+            fx = _fp_value(x, depth + 1)
+            if fx:
+                items.append(repr(k) + ":" + fx)
+        return "{" + ",".join(sorted(items)) + "}" if items else ""
+    return ""
+
+def fingerprint(mod):
+    parts = []
+    for name, v in sorted(vars(mod).items()):
+        f = _fp_value(v)
+        if f:
+            parts.append(name + "=" + f)
+        if isinstance(v, type) and getattr(v, "__module__", None) == mod.__name__:
+            for an, av in sorted(vars(v).items()):
+                f = _fp_value(av)
+                if f:
+                    parts.append(name + "." + an + "=" + f)
+    return hashlib.sha1("\n".join(parts).encode()).hexdigest()
+
+out = {}
 for m in sys.argv[2:]:
     if m != "BASE":
         __import__(m)
+        out[m] = fingerprint(sys.modules[m])
+print(json.dumps(out))
 """
 
 
@@ -189,7 +224,29 @@ def import_check(patched, modules):
         return False
     if r.returncode != 0:
         log("import check failed", modules, r.stderr.strip().splitlines()[-1:] if r.stderr else "")
-    return r.returncode == 0
+        return False
+    # module-level SQL objects built at import time must be unchanged too
+    try:
+        fps = json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception:
+        return False
+    ref = _fingerprints()
+    changed = [m for m, h in fps.items() if m in ref and ref[m] != h]
+    if changed:
+        log("import-time objects changed", changed)
+        return False
+    return True
+
+
+_FP = None
+
+
+def _fingerprints():
+    global _FP
+    if _FP is None:
+        fn = MAP / "fingerprints.json"
+        _FP = json.loads(fn.read_text()) if fn.exists() else {}
+    return _FP
 
 
 # ---------------------------------------------------------------- maps
