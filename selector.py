@@ -147,6 +147,7 @@ class Maps:
         self.by_file = {}
         for t in tests:
             self.by_file.setdefault(t["file"], []).append(t["number"])
+        self.file_of = {t["number"]: t["file"] for t in tests}
         meta = ("::test_lazy_load", "test_dialect_imports.py::", "test_dialect_entry_points.py::")
         self.import_meta = {t["number"] for t in tests if any(m in t["id"] for m in meta)}
 
@@ -269,6 +270,7 @@ class Selector:
         self._name_index = None
         self._subs = None
         self._tsrc = {}
+        self._tsrc_pre = None
         self._trees = {}
         self._scopes = {}
         self._alltsrc = None
@@ -340,6 +342,10 @@ class Selector:
             return "ALL"
         cov = self.m.cov(path) or {}
         sel = set()
+        if path.startswith("sqlglot/typing/"):
+            # tests/test_typing.py imports every typing module and compares the
+            # metadata tables (and annotator code) against their parents
+            sel |= set(self.m.by_file.get("tests/test_typing.py", []))
         unresolved = False
         for line in sorted(changed_old_lines(fp["hunks"])):
             v = cov.get(str(line))
@@ -551,6 +557,16 @@ class Selector:
         return out
 
     def test_sources(self, files):
+        if self._tsrc_pre is None:
+            fn = MAP / "tsrc.json.gz"
+            self._tsrc_pre = {}
+            if fn.exists():
+                with gzip.open(fn, "rt") as f:
+                    pre = json.load(f)
+                self._tsrc_pre = {self.m.by_id[k]: v for k, v in pre.items() if k in self.m.by_id}
+        if self._tsrc_pre:
+            wanted = set(files)
+            return {n: src for n, src in self._tsrc_pre.items() if self.m.file_of[n] in wanted}
         out = {}
         for f in files:
             if f in self._tsrc:
