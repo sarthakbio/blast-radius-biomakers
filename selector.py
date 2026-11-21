@@ -147,6 +147,8 @@ class Maps:
         self.by_file = {}
         for t in tests:
             self.by_file.setdefault(t["file"], []).append(t["number"])
+        meta = ("::test_lazy_load", "test_dialect_imports.py::", "test_dialect_entry_points.py::")
+        self.import_meta = {t["number"] for t in tests if any(m in t["id"] for m in meta)}
 
     def cov(self, path):
         if path not in self._cov:
@@ -270,6 +272,7 @@ class Selector:
         self._trees = {}
         self._scopes = {}
         self._alltsrc = None
+        self.pad = [set(), set()]
         self._fxt = {}
 
     def scopes(self, path, tree):
@@ -375,11 +378,74 @@ class Selector:
                         vv = cov.get(str(l))
                         if vv and len(vv) > 1:
                             sel |= self.m.tests_of(vv[1:])
+            # padding candidates (added only where they cost nothing)
+            if t_old is not None:
+                enclosing = None
+                for node, kind, s0, e0, q in self.scopes(path, t_old):
+                    if s0 <= line <= e0 and (enclosing is None or e0 - s0 < enclosing[1] - enclosing[0]):
+                        enclosing = (s0, e0)
+                lo, hi = enclosing if enclosing else (line - 10, line + 10)
+                near = set()
+                for l in range(lo, hi + 1):
+                    vv = cov.get(str(l))
+                    if vv and len(vv) > 1:
+                        near.update(vv[1:])
+                self.pad[0] |= self.m.tests_of(near)
+            if not in_body:
+                self.pad[0] |= self.m.import_meta
+            if in_body and t_old is not None:
+                sel |= self.persistent_effects(path, t_old, line, cov, v)
             if not in_body or v and v[0] == 1 or st is None or v is None:
                 # executed only at import time (or not covered at all):
                 # work out what the statement defines and who uses it.
                 sel |= self.import_level(path, t_old, line, cov)
         return sel
+
+    def def_runners(self, cov, s0, e0):
+        out = set()
+        for l in range(s0, e0 + 1):
+            vv = cov.get(str(l))
+            if vv and len(vv) > 1:
+                out.update(vv[1:])
+        return self.m.tests_of(out)
+
+    def persistent_effects(self, path, tree, line, cov, v):
+        """Code inside a function whose result outlives the call: run while the
+        module is imported (metaclasses, __init_subclass__, table builders), or
+        filling a cache on first use.  Coverage charges such lines only to the
+        first test of each worker, so widen to everyone downstream."""
+        inner = None
+        for node, kind, s0, e0, q in self.scopes(path, tree):
+            if kind == "def" and node.body[0].lineno <= line <= e0 and (inner is None or e0 - s0 < inner[2] - inner[1]):
+                inner = (node, s0, e0, q)
+        if inner is None:
+            return set()
+        node, s0, e0, q = inner
+        out = set()
+        ntests = (len(v) - 1) if v else 0
+        if v and v[0] == 1 and ntests < 50:
+            meta = node.name in ("__new__", "__init_subclass__", "__set_name__") or (
+                node.name == "__init__" and "." in q and q.split(".")[-2].startswith("_"))
+            if meta:
+                log("broad: import-time class construction", path, line)
+                return set(self.m.all)
+            out |= self.name_readers({node.name}) | self.module_users(path) | self.def_runners(cov, s0, e0)
+        # first-use caches: a branch that stores into a module/class level container
+        globals_ = {t.id for n in tree.body if isinstance(n, (ast.Assign, ast.AnnAssign))
+                    for t in (n.targets if isinstance(n, ast.Assign) else [n.target]) if isinstance(t, ast.Name)}
+        for sub in ast.walk(node):
+            if isinstance(sub, (ast.If, ast.For, ast.While, ast.Try, ast.With)) and sub.lineno <= line <= sub.end_lineno:
+                for a in ast.walk(sub):
+                    if isinstance(a, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                        tgts = a.targets if isinstance(a, ast.Assign) else [a.target]
+                        for tg in tgts:
+                            base = tg
+                            while isinstance(base, (ast.Subscript, ast.Attribute)):
+                                base = base.value
+                            if isinstance(base, ast.Name) and (base.id in globals_ or base.id == "cls" and tg is not base):
+                                out |= self.def_runners(cov, s0, e0)
+                                return out
+        return out
 
     def import_level(self, path, tree, line, cov):
         if tree is None:
@@ -563,12 +629,18 @@ class Selector:
                         if b:
                             bases.add(b)
         files = [f for f in self.m.by_file if any(f.endswith("/test_" + b + ".py") for b in bases)]
-        if not files:
-            return set()
         out = set()
         for n, src in self.test_sources(files).items():
             if any(l in src for l in lits):
                 out.add(n)
+        if any(path.startswith("sqlglot/" + d + "/") for d in ("dialects", "parsers", "generators", "typing")):
+            # other dialects' tests that read or write this dialect and use the literal
+            if self._alltsrc is None:
+                self._alltsrc = self.test_sources(sorted(self.m.by_file))
+            dpat = re.compile(r"[\"'](" + "|".join(sorted(map(re.escape, bases))) + r")[\"']")
+            for n, src in self._alltsrc.items():
+                if n not in out and any(l in src for l in lits) and dpat.search(src):
+                    out.add(n)
         return out
 
     def select_test_file(self, path, fp):
@@ -626,8 +698,22 @@ class Selector:
     def select(self, patch_text):
         files = parse_patch(patch_text)
         sel = set()
+        self.pad = [set(), set()]
         for path, fp in files.items():
             p_old = fp["old"] or path
+            if p_old.startswith("sqlglot/") and p_old.endswith(".py"):
+                self.pad[1] |= self.module_users(p_old)
+                base = p_old.rsplit("/", 1)[-1][:-3]
+                for f, nums in self.m.by_file.items():
+                    if f.endswith("/test_" + base + ".py"):
+                        self.pad[1] |= set(nums)
+            elif p_old.startswith("tests/"):
+                if p_old.endswith(".py"):
+                    self.pad[0] |= set(self.m.by_file.get(p_old, []))
+                else:
+                    fb = self.fixture_fallback(p_old)
+                    if fb:
+                        self.pad[1] |= fb
             if fp.get("binary"):
                 r = self.select_fixture(p_old)
                 sel |= r if r is not None else set(self.m.all)
@@ -715,6 +801,27 @@ def pack(nums, dur):
     return [b for b in best[1] if b]
 
 
+def pad_workers(workers, cands, dur):
+    """Add candidate tests to workers only where they do not raise the
+    busiest worker's load (so the commit's cost is unchanged)."""
+    if not workers:
+        return workers
+    loads = [sum(dur[n] for n in w) for w in workers]
+    top = max(loads)
+    have = {n for w in workers for n in w}
+    for tier in cands:
+        for n in sorted(tier - have, key=lambda n: (dur.get(n, 10 ** 9), n)):
+            d = dur.get(n)
+            if d is None:
+                continue
+            k = loads.index(min(loads))
+            if loads[k] + d <= top:
+                workers[k].append(n)
+                loads[k] += d
+                have.add(n)
+    return workers
+
+
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     maps = Maps(tests)
@@ -728,7 +835,12 @@ def main():
             log("error", cid, repr(e))
             chosen = set(maps.all)
         chosen = {n for n in chosen if n in maps.dur}
-        out.append(json.dumps({"commit": cid, "workers": pack(chosen, maps.dur)}, separators=(",", ":")))
+        workers = pack(chosen, maps.dur)
+        try:
+            workers = pad_workers(workers, getattr(sel, "pad", []), maps.dur)
+        except Exception as e:
+            log("pad error", cid, repr(e))
+        out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
 
