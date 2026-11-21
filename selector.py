@@ -1144,6 +1144,9 @@ def main():
         except Exception as e:  # never crash: fall back to everything
             log("error", cid, repr(e))
             chosen = set(maps.all)
+        # DIAGNOSTIC PROBE: everything for commits touching tests/
+        if re.search(r"^diff --git a/tests/", p.read_text(encoding="utf-8", errors="replace"), re.M):
+            chosen = set(maps.all)
         chosen = {n for n in chosen if n in maps.dur}
         workers = pack(chosen, maps.dur)
         try:
