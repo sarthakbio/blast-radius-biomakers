@@ -182,6 +182,26 @@ def norm(node):
     return ast.dump(node, annotate_fields=True, include_attributes=False)
 
 
+def same_code(a, b):
+    """True when two sources tokenize identically once comments and blank
+    lines are dropped, which implies the same AST."""
+    import io
+    import tokenize
+
+    def toks(text):
+        out = []
+        for t in tokenize.generate_tokens(io.StringIO(text).readline):
+            if t.type in (tokenize.COMMENT, tokenize.NL):
+                continue
+            out.append((t.type, t.string))
+        return out
+
+    try:
+        return toks(a) == toks(b)
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return False
+
+
 def scopes(tree):
     """List of (node, kind, start, end, qualname) for every def/class."""
     out = []
@@ -214,11 +234,17 @@ def assigned_names(stmt):
     return names
 
 
+_STMTS = {}
+
+
 def stmt_at(tree, line):
     """Innermost statement containing line."""
+    key = id(tree)
+    if key not in _STMTS:
+        _STMTS[key] = (tree, [n for n in ast.walk(tree) if isinstance(n, ast.stmt)])
     best = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.stmt) and node.lineno <= line <= (node.end_lineno or node.lineno):
+    for node in _STMTS[key][1]:
+        if node.lineno <= line <= (node.end_lineno or node.lineno):
             if best is None or (node.end_lineno - node.lineno) <= (best.end_lineno - best.lineno):
                 best = node
     return best
@@ -239,6 +265,23 @@ class Selector:
         self.m = maps
         self._src = {}
         self._name_index = None
+        self._subs = None
+        self._tsrc = {}
+        self._trees = {}
+        self._scopes = {}
+        self._alltsrc = None
+        self._fxt = {}
+
+    def scopes(self, path, tree):
+        if path not in self._scopes:
+            self._scopes[path] = scopes(tree)
+        return self._scopes[path]
+
+    def tree(self, path):
+        if path not in self._trees:
+            src = self.src(path)
+            self._trees[path] = strip_ast(src) if src is not None else None
+        return self._trees[path]
 
     def src(self, path):
         if path not in self._src:
@@ -286,14 +329,12 @@ class Selector:
         if old is None:
             return None  # new file: unknown
         new = apply_hunks(old, fp["hunks"])
-        t_old, t_new = strip_ast(old), strip_ast(new)
+        if same_code(old, new):
+            return set()
+        t_old, t_new = self.tree(path), strip_ast(new)
         if t_new is None:
             # syntax error: every test that imports sqlglot fails at import
             return "ALL"
-        if t_old is not None and norm(t_old) == norm(t_new):
-            # comments / formatting only.  Docstrings are part of the AST, so
-            # this really cannot change behaviour.
-            return set()
         cov = self.m.cov(path) or {}
         sel = set()
         unresolved = False
@@ -314,7 +355,27 @@ class Selector:
                     sel |= self.m.tests_of(vv[1:])
                     if v is None:
                         v = vv
-            if v and v[0] == 1 or st is None or (v is None and st is not None):
+            in_body = False
+            if t_old is not None:
+                for node, kind, s0, e0, q in self.scopes(path, t_old):
+                    if kind == "def" and node.body[0].lineno <= line <= e0:
+                        in_body = True
+                        break
+            # module / class level code runs at import time, which the coverage
+            # map may have charged to whichever test imported the module first.
+            if in_body and t_old is not None:
+                # factory functions (they build closures/lambdas, often while the
+                # module is imported): whoever runs the code they build.
+                inner = None
+                for node, kind, s0, e0, q in self.scopes(path, t_old):
+                    if kind == "def" and s0 <= line <= e0 and (inner is None or e0 - s0 < inner[2] - inner[1]):
+                        inner = (node, s0, e0)
+                if inner is not None and any(isinstance(n, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)) and n is not inner[0] for n in ast.walk(inner[0])):
+                    for l in range(inner[1], inner[2] + 1):
+                        vv = cov.get(str(l))
+                        if vv and len(vv) > 1:
+                            sel |= self.m.tests_of(vv[1:])
+            if not in_body or v and v[0] == 1 or st is None or v is None:
                 # executed only at import time (or not covered at all):
                 # work out what the statement defines and who uses it.
                 sel |= self.import_level(path, t_old, line, cov)
@@ -372,16 +433,143 @@ class Selector:
         if not names:
             return users
         readers = self.name_readers(names)
-        # also values inside the statement (e.g. dict entries mapping exp.Foo -> fn):
-        refs = set()
-        for node in ast.walk(st):
-            if isinstance(node, ast.Attribute):
-                refs.add(node.attr)
-        sel = (readers & users) if readers else users
-        if isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and isinstance(getattr(st, "value", None), (ast.Dict, ast.Call, ast.Set, ast.List, ast.Tuple)):
-            # a table entry: everyone using this module and the table
-            sel = (readers & users) if readers else users
+        sel = (readers & users) if readers else set(users)
+        if best and best[1] == "class" and path.startswith("sqlglot/expressions/") and "." not in best[4]:
+            # an Expression subclass's class-level data is only observable on
+            # instances of it (or its subclasses): who names those classes in
+            # code, plus tests whose SQL uses the function's SQL names.
+            cls = best[0]
+            cnames = {cls.name} | self.subclasses(cls.name)
+            sel = self.name_readers(cnames | {c.lower() + "_sql" for c in cnames})
+            words = set()
+            for c in cnames:
+                words.add(re.sub(r"(?<!^)(?=[A-Z])", "_", c).lower())
+            for node in cls.body:
+                if isinstance(node, (ast.Assign, ast.AnnAssign)) and "_sql_names" in assigned_names(node):
+                    for c in ast.walk(node):
+                        if isinstance(c, ast.Constant) and isinstance(c.value, str):
+                            words.add(c.value.lower())
+                    if node.lineno <= line <= node.end_lineno:
+                        words |= self.line_literals(path, line)
+            sel |= self.global_word_users(words)
+            if len(cnames) > 1 or not sel:
+                sel |= (readers & users) if readers else set(users)
+            return sel | self.literal_users(path, st, line)
+        if best and best[1] == "class":
+            cls = best[0]
+            # users of the class itself (and its subclasses): anything that
+            # names it, plus its generator method by convention.
+            cnames = {cls.name} | self.subclasses(cls.name)
+            extra = self.name_readers(cnames | {c.lower() + "_sql" for c in cnames})
+            if not any(path.startswith("sqlglot/" + d + "/") for d in ("dialects", "parsers", "generators", "typing")) or cls.name in ("Tokenizer",):
+                sel |= extra
+        # string keys / literals on the changed line: tests whose source names them
+        sel |= self.literal_users(path, st, line)
+        if not sel:
+            sel = set(users)
         return sel
+
+    def subclasses(self, name, depth=3):
+        if self._subs is None:
+            self._subs = json.loads((MAP / "subclasses.json").read_text()) if (MAP / "subclasses.json").exists() else {}
+        out, frontier = set(), {name}
+        for _ in range(depth):
+            nxt = set()
+            for n in frontier:
+                nxt |= set(self._subs.get(n, ()))
+            nxt -= out
+            out |= nxt
+            frontier = nxt
+            if len(out) > 400:
+                break
+        return out
+
+    def test_sources(self, files):
+        out = {}
+        for f in files:
+            if f in self._tsrc:
+                out.update(self._tsrc[f])
+                continue
+            d = {}
+            src = self.src(f)
+            if src:
+                try:
+                    tree = ast.parse(src)
+                except SyntaxError:
+                    tree = None
+                if tree is not None:
+                    lines = src.split("\n")
+                    defs = {}
+                    for node in ast.walk(tree):
+                        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            defs.setdefault(node.name, []).append("\n".join(lines[node.lineno - 1:node.end_lineno]))
+                    for t in self.m.tests:
+                        if t["file"] == f:
+                            nm = t["id"].split("::")[-1].split("[")[0]
+                            d[t["number"]] = "\n".join(defs.get(nm, ())).lower()
+            self._tsrc[f] = d
+            out.update(d)
+        return out
+
+    def line_literals(self, path, line):
+        old = self.src(path).split("\n")
+        text = old[line - 1] if 0 < line <= len(old) else ""
+        return set(m.lower() for m in re.findall(r"[\"']([A-Za-z_][A-Za-z0-9_]{2,})[\"']", text))
+
+    def global_word_users(self, words):
+        """Tests whose own source, or a fixture they read, contains one of the
+        words (case-insensitive, whole word)."""
+        words = {w for w in words if len(w) >= 3}
+        if not words:
+            return set()
+        if self._alltsrc is None:
+            self._alltsrc = self.test_sources(sorted(self.m.by_file))
+        pat = re.compile(r"(?<![a-z0-9_])(" + "|".join(sorted(map(re.escape, words))) + r")(?![a-z0-9_])")
+        out = {n for n, src in self._alltsrc.items() if pat.search(src)}
+        fx = self.m.extra.get("fixtures", {})
+        for path, ids in fx.items():
+            txt = self.fixture_text(path)
+            if txt and pat.search(txt):
+                out |= {self.m.by_id[i] for i in ids if i in self.m.by_id}
+        return out
+
+    def fixture_text(self, path):
+        if path not in self._fxt:
+            t = None
+            fn = MAP / "fixtures" / (path.replace("/", "__") + ".txt")
+            if fn.exists():
+                t = fn.read_text(encoding="utf-8", errors="replace").lower()
+            self._fxt[path] = t
+        return self._fxt[path]
+
+    def literal_users(self, path, st, line):
+        if st is None:
+            return set()
+        old = self.src(path).split("\n")
+        text = old[line - 1] if 0 < line <= len(old) else ""
+        lits = set(m.lower() for m in re.findall(r"[\"']([A-Za-z_][A-Za-z0-9_ ]{2,})[\"']", text))
+        lits = {l for l in lits if len(l) >= 4 and l not in ("this", "expression", "expressions", "true", "false", "null")}
+        if not lits:
+            return set()
+        base = path.rsplit("/", 1)[-1][:-3]
+        bases = {base}
+        tree = self.tree(path)
+        if tree is not None:
+            # dialects built on this one (e.g. Databricks on Spark) see the change too
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef):
+                    for sub in self.subclasses(node.name):
+                        b = re.sub(r"(Parser|Generator|Tokenizer|Dialect|TypeAnnotator)$", "", sub).lower()
+                        if b:
+                            bases.add(b)
+        files = [f for f in self.m.by_file if any(f.endswith("/test_" + b + ".py") for b in bases)]
+        if not files:
+            return set()
+        out = set()
+        for n, src in self.test_sources(files).items():
+            if any(l in src for l in lits):
+                out.add(n)
+        return out
 
     def select_test_file(self, path, fp):
         old = self.src(path)
@@ -389,11 +577,11 @@ class Selector:
         if old is None:
             return set(tests_here)
         new = apply_hunks(old, fp["hunks"])
-        t_old, t_new = strip_ast(old), strip_ast(new)
+        if same_code(old, new):
+            return set()
+        t_old, t_new = self.tree(path), strip_ast(new)
         if t_new is None:
             return set(tests_here)
-        if t_old is not None and norm(t_old) == norm(t_new):
-            return set()
         sel = set()
         byname = {}
         for t in self.m.tests:
