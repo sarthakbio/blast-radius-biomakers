@@ -1145,9 +1145,9 @@ def main():
             log("error", cid, repr(e))
             chosen = set(maps.all)
         chosen = {n for n in chosen if n in maps.dur}
-        # DIAGNOSTIC PROBE B: everything when nothing was selected
-        if not chosen:
-            chosen = set(maps.all)
+        # DIAGNOSTIC PROBE C: add every test touching the changed files (padding tier 1)
+        if chosen and len(chosen) < len(maps.all):
+            chosen |= set(sel.pad[1]) | set(sel.pad[0])
         workers = pack(chosen, maps.dur)
         try:
             workers = pad_workers(workers, getattr(sel, "pad", []), maps.dur)
