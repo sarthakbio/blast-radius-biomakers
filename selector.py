@@ -1145,9 +1145,11 @@ def main():
             log("error", cid, repr(e))
             chosen = set(maps.all)
         chosen = {n for n in chosen if n in maps.dur}
-        # DIAGNOSTIC PROBE C: add every test touching the changed files (padding tier 1)
-        if chosen and len(chosen) < len(maps.all):
-            chosen |= set(sel.pad[1]) | set(sel.pad[0])
+        # tests that check imports in a subprocess (test_lazy_load) or across
+        # threads are invisible to the coverage map: include them, cheaply,
+        # whenever sqlglot code changes behaviour.
+        if chosen and len(chosen) < len(maps.all) and getattr(sel, "patched", None):
+            chosen |= maps.import_meta
         workers = pack(chosen, maps.dur)
         try:
             workers = pad_workers(workers, getattr(sel, "pad", []), maps.dur)
